@@ -5,6 +5,7 @@ import glob
 import zipfile
 import tempfile
 import datetime
+import shutil
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -28,12 +29,13 @@ LOG_FILE_PATH = os.path.join(os.getcwd(), "automation_log.txt")
 defaults = {
     "step": 0,
     "sso_id": "",
+    "password": "",
     "platform": "Pulse Tickets",
     "ticket_type_key": "Yes",
     "tickets": [],
     "logs": [],
     "download_dir": None,
-    "headless": False,
+    "headless": True,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -202,11 +204,7 @@ def safe_click(driver, el):
 
 
 # ==========================================================
-# Iframe-aware search wrapper
-# IMPORTANT: iframes are found via deep_find_all() (shadow-DOM aware),
-# NOT driver.find_elements(By.TAG_NAME, "iframe"), because ServiceNow's
-# classic-UI iframe (gsft_main) is nested inside a shadow root and is
-# completely invisible to plain find_elements().
+# Iframe-aware search wrapper (iframes found via shadow-DOM-aware search)
 # ==========================================================
 def find_across_frames(driver, finder_fn, max_depth=3):
     el = finder_fn(driver)
@@ -283,7 +281,7 @@ def wait_until_gone(driver, ticket, description, css_selector, timeout=30, inter
 
 
 # ==========================================================
-# Diagnostics — dumps detailed page state to the log (and log file)
+# Diagnostics
 # ==========================================================
 def debug_dump_page_state(driver, ticket):
     try:
@@ -293,7 +291,7 @@ def debug_dump_page_state(driver, ticket):
         log(f"  [DEBUG] Page title: {driver.title}")
         log(f"  [DEBUG] Number of window handles: {len(driver.window_handles)}")
 
-        iframes = deep_find_all(driver, "iframe")  # shadow-DOM aware
+        iframes = deep_find_all(driver, "iframe")
         log(f"  [DEBUG] Found {len(iframes)} iframe(s) on the page (incl. shadow DOM):")
         for i, f in enumerate(iframes):
             try:
@@ -340,17 +338,6 @@ def debug_dump_page_state(driver, ticket):
                 log(f"    [iframe[{i}]] could not switch into frame: {e}")
                 driver.switch_to.default_content()
 
-        try:
-            html = driver.page_source
-            idx = html.lower().find("additional")
-            if idx >= 0:
-                snippet = html[max(0, idx - 200):idx + 300]
-                log(f"  [DEBUG] HTML snippet around 'additional': ...{snippet}...")
-            else:
-                log("  [DEBUG] The word 'additional' was not found anywhere in top-level page_source.")
-        except Exception as e:
-            log(f"  [DEBUG] Could not dump page_source: {e}")
-
         log(f"  [DEBUG] === End diagnostics for {ticket} ===")
 
     except Exception as e:
@@ -360,9 +347,9 @@ def debug_dump_page_state(driver, ticket):
 
 
 # ==========================================================
-# Selenium driver setup
+# Selenium driver setup (auto-managed driver, no manual paths)
 # ==========================================================
-def build_driver(download_dir: str, headless: bool = False):
+def build_driver(download_dir: str, headless: bool = True):
     options = Options()
     if headless:
         options.add_argument("--headless=new")
@@ -373,7 +360,9 @@ def build_driver(download_dir: str, headless: bool = False):
     prefs = {
         "download.default_directory": download_dir,
         "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
         "plugins.always_open_pdf_externally": True,
+        "safebrowsing.enabled": True,
     }
     options.add_experimental_option("prefs", prefs)
 
@@ -390,52 +379,86 @@ def build_driver(download_dir: str, headless: bool = False):
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
 
+    # CRITICAL for headless mode: prefs alone are not enough to enable
+    # downloads in headless Chrome — must explicitly allow via CDP.
+    try:
+        driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+            "behavior": "allow",
+            "downloadPath": download_dir
+        })
+        log(f"Download behavior explicitly set via CDP to: {download_dir}")
+    except Exception as e:
+        log(f"Warning: could not set CDP download behavior: {e}")
+
     return driver
 
 
 # ==========================================================
-# Login — visual + manual
+# Login — fully automated username + password, then wait for MFA push
 # ==========================================================
-def login(driver, sso_id: str):
+def login(driver, sso_id: str, password: str):
     login_url = "https://pulse.service-now.com/now/nav/ui/home"
     expected_domain = "pulse.service-now.com"
 
-    log("Opening login page in the browser window...")
+    log("Opening login page...")
     driver.get(login_url)
     show_screenshot(driver, "Login page loaded")
 
     try:
-        username_field = WebDriverWait(driver, 10).until(
+        username_field = WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.XPATH, "//input[@type='text']"))
         )
         username_field.send_keys(sso_id)
-        log("Auto-filled SSO ID. Please continue manually in the browser window "
-            "(password, MFA, any prompts).")
-        show_screenshot(driver, "SSO ID auto-filled — continue manually")
-    except TimeoutException:
-        log("Could not find username field automatically. "
-            "Please log in fully manually in the browser window.")
-        show_screenshot(driver, "Manual login required")
+        show_screenshot(driver, "Username entered")
+        log("Entered SSO ID, clicking Next...")
 
-    log("Please complete SSO login (password, MFA/authenticator approval, etc.) "
-        "yourself. Waiting for login to complete... (up to 5 minutes)")
+        next_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Next')]"))
+        )
+        next_btn.click()
+    except TimeoutException:
+        show_screenshot(driver, "FAILED at username step")
+        raise TimeoutException("Could not find username field or Next button on login page")
+
+    try:
+        password_field = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.XPATH, "//input[@type='password']"))
+        )
+        password_field.send_keys(password)
+        show_screenshot(driver, "Password entered")
+        log("Entered password, submitting...")
+
+        login_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Log In & Remember Me')]"))
+        )
+        login_btn.click()
+    except TimeoutException:
+        show_screenshot(driver, "FAILED at password step")
+        raise TimeoutException("Could not find password field or Login button")
+
+    log("Password submitted. A push notification should now be sent to your "
+        "authenticator app. Please approve it on your phone.")
+    log("Waiting for you to approve the push notification... (up to 5 minutes)")
 
     start = time.time()
     timeout = 300
     while time.time() - start < timeout:
         if expected_domain in driver.current_url and "login" not in driver.current_url.lower():
             break
-        show_screenshot(driver, "Waiting for you to complete login...")
+        show_screenshot(driver, "Waiting for MFA push approval on your phone...")
         time.sleep(3)
     else:
-        raise TimeoutException("Login was not completed within 5 minutes.")
+        raise TimeoutException(
+            "Login was not completed within 5 minutes. "
+            "Did you approve the push notification on your phone?"
+        )
 
-    log("Detected successful login! Resuming automation...")
+    log("Login successful! Resuming automation...")
     show_screenshot(driver, "Logged in successfully")
 
 
 # ==========================================================
-# Step 1: search box (shadow-DOM aware, top-level document only)
+# Step 1: search box (shadow-DOM aware)
 # ==========================================================
 def open_search_and_type(driver, ticket):
     def find_input():
@@ -471,7 +494,7 @@ def open_search_and_type(driver, ticket):
 
 
 # ==========================================================
-# Full ticket download flow — shadow-DOM + iframe aware, with diagnostics
+# Full ticket download flow
 # ==========================================================
 def download_ticket_pdf(driver, ticket: str):
     driver.switch_to.default_content()
@@ -504,7 +527,7 @@ def download_ticket_pdf(driver, ticket: str):
 
     time.sleep(3)
 
-    log("  Step 2b: confirming ticket detail page loaded (checking main page AND any iframes)")
+    log("  Step 2b: confirming ticket detail page loaded")
     wait_for_spinner_to_clear(driver, ticket, "Step 2b (opening ticket)", timeout=30)
 
     menu_selectors = [
@@ -530,13 +553,12 @@ def download_ticket_pdf(driver, ticket: str):
         timeout=40, interval=2
     )
     if menu_btn is None:
-        log(f"  Step 2b: FAILED for {ticket} — running diagnostics (see {LOG_FILE_PATH})...")
+        log(f"  Step 2b: FAILED for {ticket} — running diagnostics...")
         debug_dump_page_state(driver, ticket)
         show_screenshot(driver, f"[{ticket}] Step 2b: FAILED — see automation_log.txt")
         raise TimeoutException(
-            f"Ticket detail page never finished loading for {ticket} "
-            f"(no 'additional actions' button found in main page or any iframe). "
-            f"See {LOG_FILE_PATH} for full diagnostics."
+            f"Ticket detail page never finished loading for {ticket}. "
+            f"See {LOG_FILE_PATH} for diagnostics."
         )
 
     log("  Step 3: opening 'Additional actions' menu")
@@ -623,13 +645,30 @@ def download_ticket_pdf(driver, ticket: str):
     driver.switch_to.default_content()
 
 
-def wait_for_new_download(download_dir: str, before_files: set, timeout: int = 60):
+# ==========================================================
+# Download detection — checks multiple candidate folders as a safety net
+# ==========================================================
+def get_candidate_download_dirs(download_dir: str):
+    candidates = [download_dir]
+    home = os.path.expanduser("~")
+    default_downloads = os.path.join(home, "Downloads")
+    if default_downloads not in candidates:
+        candidates.append(default_downloads)
+    return candidates
+
+
+def wait_for_new_download(download_dir: str, before_files: set, timeout: int = 120):
+    candidate_dirs = get_candidate_download_dirs(download_dir)
     start = time.time()
     while time.time() - start < timeout:
-        current_files = set(glob.glob(os.path.join(download_dir, "*")))
+        current_files = set()
+        for d in candidate_dirs:
+            current_files |= set(glob.glob(os.path.join(d, "*")))
         new_files = current_files - before_files
-        finished = [f for f in new_files if not f.endswith(".crdownload")]
-        still_downloading = any(f.endswith(".crdownload") for f in current_files)
+        finished = [f for f in new_files if not f.endswith(".crdownload") and not f.endswith(".tmp")]
+        still_downloading = any(
+            f.endswith(".crdownload") or f.endswith(".tmp") for f in current_files
+        )
         if finished and not still_downloading:
             return finished[0]
         time.sleep(1)
@@ -642,14 +681,14 @@ def rename_downloaded_file(filepath: str, ticket_number: str, ticket_type_label:
     safe_label = ticket_type_label.replace(" ", "_")
     new_name = os.path.join(download_dir, f"{ticket_number}_{safe_label}.pdf")
     try:
-        os.rename(filepath, new_name)
+        shutil.move(filepath, new_name)
         return new_name
     except Exception as e:
-        log(f"Error renaming file: {e}")
+        log(f"Error moving/renaming file: {e}")
         return None
 
 
-def run_automation(sso_id, tickets, ticket_type_label, download_dir, headless):
+def run_automation(sso_id, password, tickets, ticket_type_label, download_dir, headless):
     driver = None
     try:
         try:
@@ -659,24 +698,27 @@ def run_automation(sso_id, tickets, ticket_type_label, download_dir, headless):
             pass
 
         driver = build_driver(download_dir, headless=headless)
-        login(driver, sso_id)
+        login(driver, sso_id, password)
 
         for ticket in tickets:
             try:
                 log(f"Processing ticket: {ticket}")
-                before_files = set(glob.glob(os.path.join(download_dir, "*")))
+                before_files = set()
+                for d in get_candidate_download_dirs(download_dir):
+                    before_files |= set(glob.glob(os.path.join(d, "*")))
 
                 download_ticket_pdf(driver, ticket)
 
-                downloaded_file = wait_for_new_download(download_dir, before_files, timeout=90)
+                downloaded_file = wait_for_new_download(download_dir, before_files, timeout=120)
                 if downloaded_file:
                     renamed = rename_downloaded_file(downloaded_file, ticket, ticket_type_label, download_dir)
                     if renamed:
                         log(f"Ticket {ticket} downloaded and renamed to: {os.path.basename(renamed)}")
                     else:
-                        log(f"Ticket {ticket} downloaded but renaming failed.")
+                        log(f"Ticket {ticket} downloaded but renaming failed. File was at: {downloaded_file}")
                 else:
-                    log(f"Ticket {ticket}: download did not complete within timeout.")
+                    log(f"Ticket {ticket}: download did not complete within 120s. "
+                        f"Checked folders: {get_candidate_download_dirs(download_dir)}")
 
             except TimeoutException as e:
                 msg = str(e).strip() or "(no additional details)"
@@ -710,32 +752,33 @@ def make_zip(download_dir: str) -> str:
 # ==========================================================
 st.title("Sequential Ticket Automation")
 
-st.caption(f"Detailed logs are also saved to: `{LOG_FILE_PATH}` — open this file in Notepad "
-           f"after a run to copy the full diagnostics if something fails.")
+st.caption(f"Detailed logs are also saved to: `{LOG_FILE_PATH}`")
 
 step = st.session_state.step
 
 if step == 0:
     st.header("Login")
     st.session_state.sso_id = st.text_input("SSO ID", value=st.session_state.sso_id)
+    st.session_state.password = st.text_input("Password", type="password", value=st.session_state.password)
 
     st.info(
-        "You will complete the actual login (password, MFA/authenticator approval, "
-        "any prompts) yourself. You'll be able to watch a live screenshot feed of "
-        "the browser on the next page."
+        "Your SSO ID and password will be entered automatically. After that, "
+        "you'll just need to approve the push notification on your authenticator "
+        "app (e.g. Okta Verify / Duo / Microsoft Authenticator) on your phone — "
+        "no browser interaction needed."
     )
 
     st.session_state.headless = st.checkbox(
-        "Run headless (you can still watch via the live screenshot feed)",
+        "Run headless (leave checked for cloud deployment)",
         value=st.session_state.headless,
     )
 
     if st.button("Next"):
-        if st.session_state.sso_id:
+        if st.session_state.sso_id and st.session_state.password:
             st.session_state.step = 1
             st.rerun()
         else:
-            st.warning("Please enter your SSO ID.")
+            st.warning("Please enter your SSO ID and password.")
 
 elif step == 1:
     st.subheader("Step 1: Select platform")
@@ -780,9 +823,9 @@ elif step == 2:
     st.write(f"**Ticket type:** {ticket_type_label}")
 
     n = len(st.session_state.tickets)
-    est = 60 + n * 90
+    est = 60 + n * 120
     m, s = divmod(est, 60)
-    st.info(f"Estimated time (excluding manual login): up to {m} min {s} sec")
+    st.info(f"Estimated time (excluding manual MFA approval): up to {m} min {s} sec")
 
     st.write("**Ticket List**")
     st.write(st.session_state.tickets)
@@ -810,11 +853,13 @@ elif step == 2:
         st.session_state.logs = []
         run_automation(
             st.session_state.sso_id,
+            st.session_state.password,
             st.session_state.tickets,
             ticket_type_label,
             tmp_dir,
             st.session_state.headless,
         )
+        st.session_state.password = ""  # clear from memory after use
 
     if os.path.exists(LOG_FILE_PATH):
         with open(LOG_FILE_PATH, "r", encoding="utf-8") as f:
@@ -822,9 +867,32 @@ elif step == 2:
         st.download_button("Download full diagnostic log (automation_log.txt)",
                             log_content, file_name="automation_log.txt")
 
-    if st.session_state.download_dir and glob.glob(
-        os.path.join(st.session_state.download_dir, "*.pdf")
-    ):
-        zip_path = make_zip(st.session_state.download_dir)
-        with open(zip_path, "rb") as f:
-            st.download_button("Download all tickets (zip)", f, file_name="tickets.zip")
+    if st.session_state.download_dir:
+        pdf_files = sorted(glob.glob(os.path.join(st.session_state.download_dir, "*.pdf")))
+        if pdf_files:
+            st.write("### Downloaded Tickets")
+            st.write(f"{len(pdf_files)} PDF(s) ready:")
+
+            for pdf_path in pdf_files:
+                fname = os.path.basename(pdf_path)
+                fsize_kb = os.path.getsize(pdf_path) / 1024
+                with open(pdf_path, "rb") as f:
+                    st.download_button(
+                        f"⬇ {fname} ({fsize_kb:.0f} KB)",
+                        f,
+                        file_name=fname,
+                        mime="application/pdf",
+                        key=f"dl_{fname}",
+                    )
+
+            zip_path = make_zip(st.session_state.download_dir)
+            with open(zip_path, "rb") as f:
+                st.download_button(
+                    "⬇ Download ALL as ZIP",
+                    f,
+                    file_name="tickets.zip",
+                    mime="application/zip",
+                    key="dl_zip_all",
+                )
+        else:
+            st.info("No PDFs downloaded yet in this session.")
