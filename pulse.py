@@ -347,8 +347,46 @@ def debug_dump_page_state(driver, ticket):
 
 
 # ==========================================================
-# Selenium driver setup — prefers apt-installed chromedriver (Streamlit
-# Cloud), falls back to Selenium Manager / webdriver-manager for local dev.
+# Binary detection — searches multiple known install locations + PATH,
+# since chromium-driver can land in different places depending on the
+# base image (Debian vs Ubuntu, snap vs apt, etc.)
+# ==========================================================
+def find_browser_binary():
+    candidates = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/lib/chromium/chromium",
+        "/usr/lib/chromium-browser/chromium-browser",
+        "/snap/bin/chromium",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def find_chromedriver_binary():
+    candidates = [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+        "/snap/bin/chromedriver",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    found = shutil.which("chromedriver")
+    return found
+
+
+# ==========================================================
+# Selenium driver setup
 # ==========================================================
 def build_driver(download_dir: str, headless: bool = True):
     options = Options()
@@ -368,21 +406,26 @@ def build_driver(download_dir: str, headless: bool = True):
     }
     options.add_experimental_option("prefs", prefs)
 
-    chromium_path = "/usr/bin/chromium"
-    chromedriver_path = "/usr/bin/chromedriver"
+    chromium_path = find_browser_binary()
+    chromedriver_path = find_chromedriver_binary()
 
-    if os.path.exists(chromium_path):
+    log(f"Detected chromium binary: {chromium_path}")
+    log(f"Detected chromedriver binary: {chromedriver_path}")
+
+    if chromium_path:
         options.binary_location = chromium_path
 
     driver = None
 
-    if os.path.exists(chromedriver_path):
+    if chromedriver_path:
         try:
             service = Service(chromedriver_path)
             driver = webdriver.Chrome(service=service, options=options)
-            log(f"Using apt-installed chromedriver at {chromedriver_path}")
+            log(f"Using detected chromedriver at {chromedriver_path}")
         except Exception as e:
-            log(f"apt-installed chromedriver failed: {e}")
+            log(f"Detected chromedriver failed to launch: {e}")
+    else:
+        log("No chromedriver binary found via known paths or system PATH.")
 
     if driver is None:
         try:
@@ -440,7 +483,6 @@ def login(driver, sso_id: str, password: str):
         show_screenshot(driver, "FAILED at username step")
         raise TimeoutException("Could not find username field or Next button on login page")
 
-    # Wait 2 seconds for the password page/field to fully render before interacting
     log("Waiting 2 seconds before entering password...")
     time.sleep(2)
     show_screenshot(driver, "Waiting before password entry")
