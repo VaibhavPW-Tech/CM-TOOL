@@ -1,5 +1,3 @@
 streamlit
 selenium>=4.15
 webdriver-manager
-chromium
-chromium-driver
