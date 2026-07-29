@@ -347,9 +347,7 @@ def debug_dump_page_state(driver, ticket):
 
 
 # ==========================================================
-# Binary detection — searches multiple known install locations + PATH,
-# since chromium-driver can land in different places depending on the
-# base image (Debian vs Ubuntu, snap vs apt, etc.)
+# Binary detection
 # ==========================================================
 def find_browser_binary():
     candidates = [
@@ -687,21 +685,51 @@ def download_ticket_pdf(driver, ticket: str):
     log("  Step 6b: confirming orientation dialog closed")
     wait_until_gone(driver, ticket, "Step 6b (orientation dialog)", "#ok_button", timeout=15)
 
-    log("  Step 7: waiting for Download button (PDF generation can take time)")
+    # ------------------------------------------------------------------
+    # Step 7: wait for Download button to appear AND become ENABLED.
+    # Previously we only checked presence, which caused clicking a button
+    # that existed but wasn't yet wired up (PDF still generating).
+    # ------------------------------------------------------------------
+    log("  Step 7: waiting for Download button to appear AND become enabled "
+        "(PDF generation can take time)")
+
+    _logged_once = {"done": False}
 
     def check_download_button(d):
         if is_loading(d):
             return None
-        return deep_find(d, "#download_button")
+        el = deep_find(d, "#download_button")
+        if el is None:
+            return None
+        try:
+            disabled_attr = el.get_attribute("disabled")
+            aria_disabled = el.get_attribute("aria-disabled")
+            classes = (el.get_attribute("class") or "").lower()
+            if not _logged_once["done"]:
+                log(f"    [debug] download_button found: disabled={disabled_attr!r} "
+                    f"aria-disabled={aria_disabled!r} class={classes!r} "
+                    f"is_enabled={el.is_enabled()}")
+                _logged_once["done"] = True
+            if disabled_attr or aria_disabled == "true" or "disabled" in classes:
+                return None
+            if not el.is_enabled():
+                return None
+        except Exception:
+            return None
+        return el
 
     download_btn = poll_until(
-        driver, ticket, "Step 7: waiting for PDF generation",
+        driver, ticket, "Step 7: waiting for PDF generation to finish (button enabled)",
         lambda: find_across_frames(driver, check_download_button),
-        timeout=90, interval=3
+        timeout=120, interval=3
     )
     if download_btn is None:
-        raise TimeoutException(f"Download button never appeared for ticket {ticket}")
-    show_screenshot(driver, f"[{ticket}] Step 7: export ready")
+        raise TimeoutException(f"Download button never became enabled for ticket {ticket}")
+    show_screenshot(driver, f"[{ticket}] Step 7: export ready (button enabled)")
+
+    # Small extra safety margin before clicking.
+    time.sleep(1)
+
     safe_click(driver, download_btn)
     log("  Step 8: clicked Download")
     show_screenshot(driver, f"[{ticket}] Step 8: downloading...")
@@ -937,7 +965,7 @@ elif step == 2:
     st.write(f"**Ticket type:** {ticket_type_label}")
 
     n = len(st.session_state.tickets)
-    est = 60 + n * 120
+    est = 60 + n * 150
     m, s = divmod(est, 60)
     st.info(f"Estimated time (excluding manual MFA approval): up to {m} min {s} sec")
 
