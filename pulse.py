@@ -6,6 +6,7 @@ import zipfile
 import tempfile
 import datetime
 import shutil
+import subprocess
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -347,8 +348,24 @@ def debug_dump_page_state(driver, ticket):
 
 
 # ==========================================================
-# Binary detection
+# Binary detection (HARDENED: known paths -> PATH -> filesystem-wide search)
 # ==========================================================
+def _filesystem_search(patterns, roots=("/usr", "/opt", "/snap", "/root", "/home")):
+    """Last-resort recursive search for a binary matching any of `patterns`."""
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for pattern in patterns:
+            try:
+                matches = glob.glob(os.path.join(root, "**", pattern), recursive=True)
+            except Exception:
+                matches = []
+            for m in matches:
+                if os.path.isfile(m) and os.access(m, os.X_OK) or os.path.isfile(m):
+                    return m
+    return None
+
+
 def find_browser_binary():
     candidates = [
         "/usr/bin/chromium",
@@ -366,7 +383,9 @@ def find_browser_binary():
         found = shutil.which(name)
         if found:
             return found
-    return None
+    # Last resort: search the filesystem (covers unusual apt install locations)
+    found = _filesystem_search(["chromium", "chromium-browser", "google-chrome*"])
+    return found
 
 
 def find_chromedriver_binary():
@@ -380,13 +399,53 @@ def find_chromedriver_binary():
         if os.path.exists(path):
             return path
     found = shutil.which("chromedriver")
+    if found:
+        return found
+    # Last resort: search the filesystem
+    found = _filesystem_search(["chromedriver"])
+    if found:
+        try:
+            os.chmod(found, 0o755)  # ensure it's executable
+        except Exception:
+            pass
     return found
+
+
+def run_environment_diagnostics():
+    """Logs what's actually installed, to make future failures easy to diagnose."""
+    log("=== Environment diagnostics ===")
+    try:
+        which_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+        which_chromedriver = shutil.which("chromedriver")
+        log(f"  which chromium: {which_chromium}")
+        log(f"  which chromedriver: {which_chromedriver}")
+    except Exception as e:
+        log(f"  which check failed: {e}")
+
+    try:
+        result = subprocess.run(
+            ["dpkg", "-l"], capture_output=True, text=True, timeout=10
+        )
+        lines = [l for l in result.stdout.splitlines() if "chrom" in l.lower()]
+        if lines:
+            log("  dpkg packages matching 'chrom':")
+            for l in lines:
+                log(f"    {l}")
+        else:
+            log("  dpkg: no chromium/chromedriver packages found "
+                "(packages.txt may be missing or app wasn't rebooted after adding it)")
+    except Exception as e:
+        log(f"  dpkg check failed or unavailable: {e}")
+
+    log("=== End environment diagnostics ===")
 
 
 # ==========================================================
 # Selenium driver setup
 # ==========================================================
 def build_driver(download_dir: str, headless: bool = True):
+    run_environment_diagnostics()
+
     options = Options()
     if headless:
         options.add_argument("--headless=new")
@@ -423,7 +482,9 @@ def build_driver(download_dir: str, headless: bool = True):
         except Exception as e:
             log(f"Detected chromedriver failed to launch: {e}")
     else:
-        log("No chromedriver binary found via known paths or system PATH.")
+        log("No chromedriver binary found via known paths, system PATH, or filesystem search. "
+            "This almost certainly means packages.txt is missing 'chromium-driver' "
+            "or the app has not been rebooted since adding it.")
 
     if driver is None:
         try:
@@ -440,7 +501,11 @@ def build_driver(download_dir: str, headless: bool = True):
             log("Using webdriver-manager driver")
         except Exception as e:
             log(f"webdriver-manager also failed: {e}")
-            raise
+            raise RuntimeError(
+                "Could not start Chrome/Chromium via any method. "
+                "Check that packages.txt contains 'chromium' and 'chromium-driver', "
+                "and that you have rebooted the app (Manage app -> Reboot) after adding it."
+            )
 
     try:
         driver.execute_cdp_cmd("Page.setDownloadBehavior", {
@@ -685,11 +750,6 @@ def download_ticket_pdf(driver, ticket: str):
     log("  Step 6b: confirming orientation dialog closed")
     wait_until_gone(driver, ticket, "Step 6b (orientation dialog)", "#ok_button", timeout=15)
 
-    # ------------------------------------------------------------------
-    # Step 7: wait for Download button to appear AND become ENABLED.
-    # Previously we only checked presence, which caused clicking a button
-    # that existed but wasn't yet wired up (PDF still generating).
-    # ------------------------------------------------------------------
     log("  Step 7: waiting for Download button to appear AND become enabled "
         "(PDF generation can take time)")
 
@@ -727,7 +787,6 @@ def download_ticket_pdf(driver, ticket: str):
         raise TimeoutException(f"Download button never became enabled for ticket {ticket}")
     show_screenshot(driver, f"[{ticket}] Step 7: export ready (button enabled)")
 
-    # Small extra safety margin before clicking.
     time.sleep(1)
 
     safe_click(driver, download_btn)
@@ -793,9 +852,6 @@ def rename_downloaded_file(filepath: str, ticket_number: str, ticket_type_label:
 
 
 def close_export_dialog(driver, ticket):
-    """Best-effort: if the 'Export Complete' dialog is still open (e.g. it
-    didn't auto-close within our wait window), try clicking Cancel/Close so
-    it doesn't block the next ticket's search."""
     def check_still_open(d):
         return deep_find(d, "#download_button")
 
@@ -1001,7 +1057,7 @@ elif step == 2:
             tmp_dir,
             st.session_state.headless,
         )
-        st.session_state.password = ""  # clear from memory after use
+        st.session_state.password = ""
 
     if os.path.exists(LOG_FILE_PATH):
         with open(LOG_FILE_PATH, "r", encoding="utf-8") as f:
