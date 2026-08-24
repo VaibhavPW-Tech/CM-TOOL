@@ -979,18 +979,13 @@ if step == 0:
             st.warning("Please enter your SSO ID and password.")
 
 elif step == 1:
-    st.subheader("Step 1: Select platform")
-    st.session_state.platform = st.radio(
-        "Platform",
-        list(TICKET_TYPE_LABELS.keys()),
-        index=list(TICKET_TYPE_LABELS.keys()).index(st.session_state.platform),
-    )
-
-    st.subheader("Step 2: Select ticket type")
+    # Step 1 & Step 2 UI (platform / ticket type selection) hidden per request.
+    # Logic preserved: platform and ticket_type_key keep using their current
+    # session_state values (set via defaults) without being changed by user input.
     labels = TICKET_TYPE_LABELS[st.session_state.platform]
     label_values = list(labels.values())
     default_label = labels[st.session_state.ticket_type_key] if st.session_state.ticket_type_key in labels else label_values[0]
-    choice_label = st.radio("Ticket type", label_values, index=label_values.index(default_label))
+    choice_label = default_label
     st.session_state.ticket_type_key = [k for k, v in labels.items() if v == choice_label][0]
 
     st.subheader("Step 3: Paste TicketNumber column (one per line)")
@@ -1017,8 +1012,8 @@ elif step == 2:
     labels = TICKET_TYPE_LABELS[st.session_state.platform]
     ticket_type_label = labels[st.session_state.ticket_type_key]
 
-    st.write(f"**Platform:** {st.session_state.platform}")
-    st.write(f"**Ticket type:** {ticket_type_label}")
+    # Platform / Ticket type display hidden per request (logic unchanged;
+    # values are still computed and used below, e.g. for automation run).
 
     n = len(st.session_state.tickets)
     est = 60 + n * 150
