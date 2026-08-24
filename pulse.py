@@ -988,7 +988,7 @@ elif step == 1:
     choice_label = default_label
     st.session_state.ticket_type_key = [k for k, v in labels.items() if v == choice_label][0]
 
-    st.subheader("Paste TicketNumber column (one per line)")
+    st.subheader("Paste Ticket Number (in a column, one per line)")
     raw = st.text_area("Tickets", height=200)
 
     col1, col2 = st.columns(2)
