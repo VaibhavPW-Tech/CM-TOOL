@@ -1924,7 +1924,7 @@ if step == 0:
     st.info(
         "Your SSO ID and password will be entered automatically. After that, "
         "you'll just need to approve the push notification on your authenticator "
-        "app (PingID) on your phone — "
+        "app (PingID) on your mobile device, "
         "no browser interaction needed."
     )
 
